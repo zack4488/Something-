@@ -2,14 +2,19 @@
 """
 Blind QR Watermark Tool (盲水印QR)
 
-Embedding technique: 2-level Haar DWT — QR and PN signature are added
-to the LL2 (lowest-frequency) subband so the mark survives JPEG
-compression, screen capture, and moderate camera capture.
+Robustness:
+  • Screenshot / camera  — DWT LL2 subband survives JPEG, blur, noise.
+  • Resize               — multi-scale probe (0.25×–4×) at detection.
+  • Crop (any position)  — periodic embedding (same PN in every 256×256 tile)
+                           + shift-invariant fold detection: fold any crop
+                           into 256×256, cyclic-correlate DWT LL2 with PN.
+  • Edits (colour, etc.) — CLAHE + sharpen pre-processing + PN correlation
+                           which is insensitive to global brightness shifts.
 
-Detection uses spread-spectrum PN correlation (no pixel-exact marker),
-which is robust to any processing that preserves low-frequency structure.
-
-Watermark removal is intentionally not provided.
+Technique:
+  2-level Haar DWT on each 256×256 tile (non-overlapping, same PN every tile).
+  QR (centred ±QR_ALPHA) + PN signature (×SIG_ALPHA) are added to LL2.
+  Detection: multi-scale scan for resize, periodic-fold + cyclic-FFT for crop.
 """
 
 import sys
@@ -22,48 +27,156 @@ import qrcode
 from PIL import Image
 from scipy.ndimage import uniform_filter
 
-# ── tunable constants ─────────────────────────────────────────────────────────
-WAVELET       = "haar"   # Haar for exact-size IDWT; robust LL subband
-DWT_LEVELS    = 2        # two levels → LL2 at 1/4 image size
-QR_ALPHA      = 48.0     # QR embedding strength in LL2
-SIG_ALPHA     = 32.0     # PN-signature strength in LL2
-SIG_SEED      = 0x6D616E # fixed seed ("man" in hex, for 盲 watermark)
-DETECT_THRESH = 10.0     # correlation threshold; ~0 for clean, ~SIG_ALPHA for watermarked
+# ── constants ─────────────────────────────────────────────────────────────────
+WAVELET      = "haar"
+TILE_SIZE    = 256                # pixels per embedding tile
+LL2_SIZE     = TILE_SIZE // 4    # = 64  (2-level DWT of TILE_SIZE)
+QR_ALPHA     = 48.0              # QR embedding strength in LL2
+SIG_ALPHA    = 32.0              # PN detection strength in LL2
+SIG_SEED     = 0x6D616E          # fixed seed ("man" for 盲)
+DETECT_THRESH = 8.0              # DWT correlation threshold (clean≈0, marked≈SIG_ALPHA)
+FOLD_THRESH   = 0.5              # spatial fold threshold (clean≈0.1, marked≈2.0)
 
-# ── DWT helpers ───────────────────────────────────────────────────────────────
-
-def _dwt2_levels(gray: np.ndarray):
-    """Return (LL2, subbands_L2, subbands_L1) for a grayscale float array."""
-    ll1, (lh1, hl1, hh1) = pywt.dwt2(gray, WAVELET)
-    ll2, (lh2, hl2, hh2) = pywt.dwt2(ll1, WAVELET)
-    return ll2, (lh2, hl2, hh2), (lh1, hl1, hh1), ll1.shape
+# Probe window sizes tried during detection (handles resize from ≈0.25× to 4×)
+PROBE_SIZES  = [64, 96, 128, 192, 256, 320, 384, 512, 640, 768, 1024]
 
 
-def _idwt2_levels(ll2, subbands_l2, subbands_l1, ll1_shape):
-    """Reconstruct a grayscale float array from modified LL2."""
-    ll1_wm = pywt.idwt2((ll2, subbands_l2), WAVELET)
-    # Crop back to the expected LL1 shape (Haar is exact, but guard anyway)
-    h, w = ll1_shape
-    ll1_wm = ll1_wm[:h, :w]
-    gray_wm = pywt.idwt2((ll1_wm, subbands_l1), WAVELET)
-    return gray_wm
+# ── PN sequence ───────────────────────────────────────────────────────────────
 
-
-# ── PN signature ──────────────────────────────────────────────────────────────
-
-def _pn_sequence(shape: tuple) -> np.ndarray:
-    """Fixed pseudo-random ±1 sequence tied to the secret seed."""
+def _pn() -> np.ndarray:
+    """Fixed 64×64 pseudo-random ±1 sequence."""
     rng = np.random.default_rng(SIG_SEED)
-    return rng.choice([-1.0, 1.0], size=shape).astype(np.float64)
+    return rng.choice([-1.0, 1.0], size=(LL2_SIZE, LL2_SIZE))
+
+
+# ── per-tile DWT helpers ──────────────────────────────────────────────────────
+
+def _tile_to_256(region: np.ndarray) -> np.ndarray:
+    """Bilinear-resize any region to TILE_SIZE×TILE_SIZE float64."""
+    if region.shape == (TILE_SIZE, TILE_SIZE):
+        return region.astype(np.float64)
+    return cv2.resize(region.astype(np.float64),
+                      (TILE_SIZE, TILE_SIZE),
+                      interpolation=cv2.INTER_LINEAR)
+
+
+def _embed_tile(tile: np.ndarray, qr64: np.ndarray, pn: np.ndarray) -> np.ndarray:
+    """
+    Embed QR + PN into a TILE_SIZE×TILE_SIZE float64 grayscale tile.
+    Returns the watermarked tile (same shape).
+    """
+    ll1, d1 = pywt.dwt2(tile, WAVELET)
+    ll2, d2 = pywt.dwt2(ll1, WAVELET)
+
+    qr_c = qr64 * 2.0 - 1.0          # centre: 0→-1 (white), 1→+1 (black)
+    ll2_wm = ll2 + QR_ALPHA * qr_c + SIG_ALPHA * pn
+
+    ll1_wm = pywt.idwt2((ll2_wm, d2), WAVELET)[:TILE_SIZE // 2, :TILE_SIZE // 2]
+    tile_wm = pywt.idwt2((ll1_wm, d1), WAVELET)[:TILE_SIZE, :TILE_SIZE]
+    return tile_wm
+
+
+def _corr_of_region(region: np.ndarray, pn: np.ndarray) -> float:
+    """
+    Resize region to TILE_SIZE×TILE_SIZE, compute DWT LL2,
+    return correlation with pn.
+    """
+    t = _tile_to_256(region)
+    ll1, _ = pywt.dwt2(t, WAVELET)
+    ll2, _ = pywt.dwt2(ll1, WAVELET)
+    return float(np.dot(ll2.ravel(), pn.ravel())) / ll2.size
+
+
+# ── multi-scale scanner ───────────────────────────────────────────────────────
+
+def _scan(gray: np.ndarray, pn: np.ndarray) -> tuple[float, np.ndarray | None]:
+    """
+    Slide windows of each probe size across gray with 50% overlap.
+    Also checks the full image resized to TILE_SIZE.
+    Returns (best_correlation, best_256×256_tile_or_None).
+    """
+    h, w = gray.shape
+    best_corr = -np.inf
+    best_tile: np.ndarray | None = None
+
+    # Full-image probe (handles extreme resize or tiny cropped remains)
+    c = _corr_of_region(gray, pn)
+    if c > best_corr:
+        best_corr = c
+        best_tile = _tile_to_256(gray)
+
+    for ps in PROBE_SIZES:
+        if ps > min(h, w):
+            continue
+        step = max(ps // 2, 16)
+        ys = list(range(0, h - ps + 1, step))
+        xs = list(range(0, w - ps + 1, step))
+        # Always include the last position so corners are checked
+        if ys and ys[-1] + ps < h:
+            ys.append(h - ps)
+        if xs and xs[-1] + ps < w:
+            xs.append(w - ps)
+        for y in ys:
+            for x in xs:
+                region = gray[y: y + ps, x: x + ps]
+                c = _corr_of_region(region, pn)
+                if c > best_corr:
+                    best_corr = c
+                    best_tile = _tile_to_256(region)
+
+    return best_corr, best_tile
+
+
+# ── shift-invariant fold detection ───────────────────────────────────────────
+
+def _fold_detect(gray: np.ndarray, pn: np.ndarray) -> float:
+    """
+    Shift-invariant watermark detection via periodic fold + spatial cross-correlation.
+
+    The embedded watermark is TILE_SIZE-periodic in spatial domain (identical PN
+    signal in every TILE_SIZE block).  Folding any crop into TILE_SIZE×TILE_SIZE
+    recovers the periodic signal regardless of crop offset.  A cyclic spatial
+    cross-correlation with the expected PN spatial pattern finds the peak without
+    knowing the offset (unlike DWT correlation, this is not fooled by the
+    non-shift-invariance of the Haar wavelet).
+
+    Returns peak / TILE_SIZE².  Watermarked ≈ 2.0, clean ≈ 0.1.
+    Use with FOLD_THRESH.  Handles any crop ≥ TILE_SIZE/2 in each dimension.
+    """
+    h, w = gray.shape
+    # Fold into TILE_SIZE×TILE_SIZE by summing all aligned blocks, then averaging
+    ph = int(np.ceil(h / TILE_SIZE)) * TILE_SIZE
+    pw = int(np.ceil(w / TILE_SIZE)) * TILE_SIZE
+    padded = np.zeros((ph, pw), dtype=np.float64)
+    padded[:h, :w] = gray
+    count = np.zeros((ph, pw), dtype=np.float64)
+    count[:h, :w] = 1.0
+
+    nb_y = ph // TILE_SIZE
+    nb_x = pw // TILE_SIZE
+    folded = padded.reshape(nb_y, TILE_SIZE, nb_x, TILE_SIZE).sum(axis=(0, 2))
+    cnt    = count.reshape(nb_y, TILE_SIZE, nb_x, TILE_SIZE).sum(axis=(0, 2))
+    folded = np.where(cnt > 0, folded / cnt, 0.0)
+
+    # Compute the expected spatial PN pattern: IDWT2 of pn placed in LL2 position
+    zeros_ll2 = (np.zeros((LL2_SIZE, LL2_SIZE)),) * 3
+    zeros_ll1 = (np.zeros((TILE_SIZE // 2, TILE_SIZE // 2)),) * 3
+    pn_ll1  = pywt.idwt2((pn, zeros_ll2), WAVELET)[:TILE_SIZE // 2, :TILE_SIZE // 2]
+    pn_spat = pywt.idwt2((pn_ll1, zeros_ll1), WAVELET)[:TILE_SIZE, :TILE_SIZE]
+
+    # Max cyclic cross-correlation finds peak at the (unknown) crop phase offset
+    ff   = np.fft.rfft2(folded)
+    ft   = np.fft.rfft2(pn_spat)
+    corr = np.real(np.fft.irfft2(ff * np.conj(ft), s=(TILE_SIZE, TILE_SIZE)))
+    return float(corr.max()) / (TILE_SIZE * TILE_SIZE)
 
 
 # ── QR helpers ────────────────────────────────────────────────────────────────
 
-def _make_qr_array(text: str, h: int, w: int) -> np.ndarray:
+def _make_qr_array(text: str) -> np.ndarray:
     """
-    Generate a QR code (float64, 0=white 1=black) sized to (h, w).
-    Uses H error-correction (30 % recoverable) and minimum version to
-    keep cells as large as possible (better blur robustness).
+    Generate a QR code and resize to LL2_SIZE×LL2_SIZE (float64, 0=white 1=black).
+    Uses error-correction level H (30 % recoverable).
     """
     qr = qrcode.QRCode(
         version=None,
@@ -78,25 +191,18 @@ def _make_qr_array(text: str, h: int, w: int) -> np.ndarray:
     pil.save(buf, format="PNG")
     buf.seek(0)
     arr = np.array(Image.open(buf).convert("L"), dtype=np.float64)
-    arr = (arr < 128).astype(np.float64)   # 1=black, 0=white
-    return cv2.resize(arr, (w, h), interpolation=cv2.INTER_NEAREST)
+    arr = (arr < 128).astype(np.float64)
+    return cv2.resize(arr, (LL2_SIZE, LL2_SIZE), interpolation=cv2.INTER_NEAREST)
 
 
 # ── camera / screenshot pre-processing ───────────────────────────────────────
 
-def _preprocess_for_detection(gray: np.ndarray) -> np.ndarray:
-    """
-    Normalise an image that may have been captured by a camera or
-    screenshot tool.  CLAHE corrects uneven lighting; mild denoise
-    reduces sensor noise; mild sharpening partially reverses lens blur.
-    """
+def _preprocess(gray: np.ndarray) -> np.ndarray:
+    """CLAHE + bilateral denoise + unsharp-mask to counter camera degradation."""
     u8 = np.clip(gray, 0, 255).astype(np.uint8)
-    # CLAHE — restores contrast lost to display / exposure variation
     clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
     u8 = clahe.apply(u8)
-    # Bilateral denoise — preserves edges better than Gaussian
     u8 = cv2.bilateralFilter(u8, d=5, sigmaColor=20, sigmaSpace=20)
-    # Unsharp mask — partially reverses camera blur
     blurred = cv2.GaussianBlur(u8, (0, 0), sigmaX=1.2)
     u8 = cv2.addWeighted(u8, 1.6, blurred, -0.6, 0)
     return u8.astype(np.float64)
@@ -107,29 +213,30 @@ def _preprocess_for_detection(gray: np.ndarray) -> np.ndarray:
 def has_watermark(image_path: str, camera_mode: bool = False) -> bool:
     """
     Return True if the image contains a blind QR watermark.
-
-    camera_mode=True applies extra pre-processing for images captured
-    by a camera or screenshot tool before correlation.
+    camera_mode applies extra pre-processing for camera/screenshot captures.
+    Robust to resize (0.25×–4×) and arbitrary crop (any portion ≥ 50% of a
+    tile survives via periodic-fold detection).
     """
     img = cv2.imread(image_path)
     if img is None:
         raise ValueError(f"Cannot read image: {image_path}")
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY).astype(np.float64)
     if camera_mode:
-        gray = _preprocess_for_detection(gray)
-    ll2, _, _, _ = _dwt2_levels(gray)
-    pn = _pn_sequence(ll2.shape)
-    corr = float(np.dot(ll2.ravel(), pn.ravel())) / ll2.size
-    return corr > DETECT_THRESH
+        gray = _preprocess(gray)
+    pn = _pn()
+    # Primary: multi-scale DWT scan (handles resize well)
+    best_corr, _ = _scan(gray, pn)
+    if best_corr > DETECT_THRESH:
+        return True
+    # Fallback: spatial fold detection (handles arbitrary crop position and phase)
+    return _fold_detect(gray, pn) > FOLD_THRESH
 
 
 def embed(image_path: str, output_path: str, text: str) -> None:
     """
-    Embed a QR code as a blind watermark and save to output_path.
-
-    The QR is embedded in the LL2 (lowest-frequency) DWT subband at
-    QR_ALPHA strength.  A PN detection signature at SIG_ALPHA is added
-    alongside it.  Both survive JPEG compression and camera capture.
+    Embed the same QR watermark in every 256×256 tile of the image.
+    The mark is TILE_SIZE-periodic so any crop of the image (any position,
+    any size ≥ TILE_SIZE/2) is detectable via the fold-based detector.
     """
     img = cv2.imread(image_path)
     if img is None:
@@ -142,58 +249,78 @@ def embed(image_path: str, output_path: str, text: str) -> None:
         )
 
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY).astype(np.float64)
-    ll2, subs_l2, subs_l1, ll1_shape = _dwt2_levels(gray)
+    h, w = gray.shape
+    pn  = _pn()
+    qr64 = _make_qr_array(text)
 
-    # Build QR and PN at LL2 size
-    qr_arr  = _make_qr_array(text, ll2.shape[0], ll2.shape[1])
-    pn      = _pn_sequence(ll2.shape)
+    diff = np.zeros((h, w), dtype=np.float64)
 
-    # Centre QR around 0 so black cells push UP and white cells push DOWN
-    qr_c = qr_arr * 2.0 - 1.0   # maps 0→-1, 1→+1
+    # Non-overlapping TILE_SIZE grid — the PN signal is the same in every tile,
+    # making the embedded mark periodic with period TILE_SIZE.
+    n_tiles = 0
+    for y in range(0, h, TILE_SIZE):
+        for x in range(0, w, TILE_SIZE):
+            ty2 = min(y + TILE_SIZE, h)
+            tx2 = min(x + TILE_SIZE, w)
+            tile_h, tile_w = ty2 - y, tx2 - x
 
-    ll2_wm = ll2 + QR_ALPHA * qr_c + SIG_ALPHA * pn
+            if tile_h < TILE_SIZE // 4 or tile_w < TILE_SIZE // 4:
+                continue
 
-    gray_wm = _idwt2_levels(ll2_wm, subs_l2, subs_l1, ll1_shape)
-    gray_wm = np.clip(gray_wm, 0, 255)
+            patch = gray[y:ty2, x:tx2]
+            patch256 = _tile_to_256(patch)
+            patch256_wm = _embed_tile(patch256, qr64, pn)
+            d256 = patch256_wm - patch256
 
-    # Apply the luminance delta to all colour channels proportionally
+            if tile_h == TILE_SIZE and tile_w == TILE_SIZE:
+                diff[y:ty2, x:tx2] = d256
+            else:
+                diff[y:ty2, x:tx2] = cv2.resize(
+                    d256, (tile_w, tile_h), interpolation=cv2.INTER_LINEAR
+                )
+            n_tiles += 1
+
+    # Apply luminance diff to all colour channels
     img_out = img.copy()
-    diff = (gray_wm - gray).astype(np.float64)
     for c in range(img.shape[2]):
         ch = img[:, :, c].astype(np.float64) + diff
         img_out[:, :, c] = np.clip(ch, 0, 255).astype(np.uint8)
 
     cv2.imwrite(output_path, img_out)
-    psnr = 10 * np.log10(255 ** 2 / max(np.mean(diff ** 2), 1e-9))
-    print(f"Watermark embedded → {output_path}  (PSNR {psnr:.1f} dB)")
+    mse  = float(np.mean(diff ** 2))
+    psnr = 10 * np.log10(255 ** 2 / max(mse, 1e-9))
+    print(f"Watermark embedded → {output_path}  (PSNR {psnr:.1f} dB, tiles: {n_tiles})")
 
 
 def _extract_qr_arr(gray: np.ndarray,
                     camera_mode: bool = False) -> np.ndarray | None:
     """
-    Return the extracted QR pattern as a binary uint8 ndarray, or None if
-    no watermark is detected.  Used internally by extract() and the GUI.
+    Locate the tile with the highest watermark correlation, extract and
+    return the embedded QR pattern as a binary uint8 ndarray.
+    Returns None if no watermark is detected.
     """
     if camera_mode:
-        gray = _preprocess_for_detection(gray)
+        gray = _preprocess(gray)
 
-    ll2, _, _, _ = _dwt2_levels(gray)
-    pn = _pn_sequence(ll2.shape)
-    corr = float(np.dot(ll2.ravel(), pn.ravel())) / ll2.size
-    if corr <= DETECT_THRESH:
+    pn = _pn()
+    best_corr, best_tile = _scan(gray, pn)
+
+    if best_corr <= DETECT_THRESH or best_tile is None:
         return None
 
-    # Subtract the PN signature to isolate QR signal + image background
-    ll2_clean = ll2 - SIG_ALPHA * pn
+    # Isolate the QR: subtract PN, subtract smooth background, threshold
+    ll1, _ = pywt.dwt2(best_tile, WAVELET)
+    ll2, _ = pywt.dwt2(ll1, WAVELET)
 
-    bg_size  = max(ll2_clean.shape[0] // 6, 8)
-    residual = ll2_clean - uniform_filter(ll2_clean, size=bg_size)
-    residual = np.clip(residual, 0, None)
+    ll2_clean = ll2 - SIG_ALPHA * pn
+    bg_size   = max(LL2_SIZE // 6, 4)
+    residual  = ll2_clean - uniform_filter(ll2_clean, size=bg_size)
+    residual  = np.clip(residual, 0, None)
 
     qr_vis = cv2.normalize(residual, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
-    _, qr_bin = cv2.threshold(qr_vis, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    _, qr_bin = cv2.threshold(qr_vis, 0, 255,
+                              cv2.THRESH_BINARY + cv2.THRESH_OTSU)
 
-    # Scale to a scannable size (≥ 300 px on the short side)
     scale = max(300 // min(qr_bin.shape), 1)
     return cv2.resize(qr_bin,
                       (qr_bin.shape[1] * scale, qr_bin.shape[0] * scale),
@@ -203,12 +330,7 @@ def _extract_qr_arr(gray: np.ndarray,
 def extract(image_path: str,
             output_qr_path: str | None = None,
             camera_mode: bool = False) -> None:
-    """
-    Extract the blind QR watermark and optionally save the QR image.
-
-    camera_mode=True pre-processes the image to handle blur / exposure
-    changes from camera capture before extraction.
-    """
+    """Extract the blind QR watermark and optionally save the QR image."""
     img = cv2.imread(image_path)
     if img is None:
         raise ValueError(f"Cannot read image: {image_path}")
@@ -229,7 +351,6 @@ def extract(image_path: str,
 
 
 def _try_decode(qr_img: np.ndarray) -> None:
-    """Try pyzbar on both polarities; print decoded content or guidance."""
     try:
         from pyzbar.pyzbar import decode as pyzbar_decode
         from PIL import Image as _PIL
@@ -249,28 +370,24 @@ def _try_decode(qr_img: np.ndarray) -> None:
 
 def main():
     ap = argparse.ArgumentParser(
-        description="Blind QR Watermark Tool (盲水印QR) — DWT-based, "
-                    "survives screenshots and camera capture"
+        description="Blind QR Watermark Tool (盲水印QR) — "
+                    "survives resize, crop, screenshot & camera capture"
     )
     ap.add_argument("--camera", action="store_true",
-                    help="Apply camera/screenshot pre-processing before "
-                         "check or extract (CLAHE + denoise + sharpen)")
+                    help="Apply camera/screenshot pre-processing (CLAHE + denoise + sharpen)")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     emb = sub.add_parser("embed", help="Add a blind QR watermark")
     emb.add_argument("input")
     emb.add_argument("output")
-    emb.add_argument("--text", "-t", required=True,
-                     help="Text or URL to encode as QR")
+    emb.add_argument("--text", "-t", required=True)
 
-    chk = sub.add_parser("check",
-                         help="Check whether an image already has a watermark")
+    chk = sub.add_parser("check", help="Check whether an image has a watermark")
     chk.add_argument("input")
 
     ext = sub.add_parser("extract", help="Extract the QR watermark")
     ext.add_argument("input")
-    ext.add_argument("--output", "-o",
-                     help="Save extracted QR image to this path")
+    ext.add_argument("--output", "-o")
 
     args = ap.parse_args()
 
