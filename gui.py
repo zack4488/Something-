@@ -1,241 +1,341 @@
 #!/usr/bin/env python3
 """
 Blind QR Watermark GUI (盲水印QR 图形界面)
-Three-tab interface: Embed · Check · Extract
+Single-page drag-and-drop interface.
+Drop (or click) an image → auto-detects watermark →
+  • If found:  shows QR pattern + decoded content
+  • If absent: shows embed form → export watermarked image
 Watermark removal is intentionally not provided.
 """
 
+import re
 import sys
-import io
 import threading
-import tkinter as tk
-from tkinter import ttk, filedialog, messagebox
+import tempfile
+import os
 from pathlib import Path
 
 import numpy as np
 from PIL import Image, ImageTk
 
+try:
+    from tkinterdnd2 import TkinterDnD, DND_FILES
+    _DND_AVAILABLE = True
+except ImportError:
+    import tkinter as _tk
+    TkinterDnD = _tk  # fallback: plain Tk
+    DND_FILES = None
+    _DND_AVAILABLE = False
+
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox
+import cv2
+
 import blind_watermark_qr as wm_core
 
 
-# ── colour palette ────────────────────────────────────────────────────────────
+# ── palette ───────────────────────────────────────────────────────────────────
 BG         = "#1e1e2e"
-PANEL      = "#2a2a3e"
-CARD       = "#313149"
+PANEL      = "#24273a"
+CARD       = "#2e3045"
 ACCENT     = "#7c6af7"
 ACCENT_HVR = "#9d8fff"
+ACCENT_DIM = "#4a4380"
 TEXT       = "#cdd6f4"
-SUBTEXT    = "#a6adc8"
+SUBTEXT    = "#8087a2"
 SUCCESS    = "#a6e3a1"
+SUCCESS_BG = "#1e3a2e"
 WARNING    = "#f9e2af"
+WARNING_BG = "#3a3020"
 ERROR      = "#f38ba8"
-BORDER     = "#45475a"
+ERROR_BG   = "#3a1e28"
+BORDER     = "#363a55"
+DROP_HL    = "#7c6af7"
 
 
-def _pil_to_tk(pil_img: Image.Image, max_w: int, max_h: int) -> ImageTk.PhotoImage:
-    pil_img = pil_img.copy()
-    pil_img.thumbnail((max_w, max_h), Image.LANCZOS)
-    return ImageTk.PhotoImage(pil_img)
+# ── helpers ───────────────────────────────────────────────────────────────────
+
+def _pil_fit(pil: Image.Image, max_w: int, max_h: int) -> ImageTk.PhotoImage:
+    c = pil.copy()
+    c.thumbnail((max_w, max_h), Image.LANCZOS)
+    return ImageTk.PhotoImage(c)
 
 
-def _cv2_array_to_pil(arr: np.ndarray) -> Image.Image:
-    import cv2
+def _bgr_to_pil(arr: np.ndarray) -> Image.Image:
     if len(arr.shape) == 3:
         return Image.fromarray(cv2.cvtColor(arr, cv2.COLOR_BGR2RGB))
     return Image.fromarray(arr)
 
 
-class PlaceholderCanvas(tk.Canvas):
-    """Canvas that shows a placeholder until an image is loaded."""
+def _parse_dnd_path(raw: str) -> str:
+    """Extract a single file path from tkinterdnd2 drop data."""
+    raw = raw.strip()
+    # Paths with spaces come wrapped in { }
+    m = re.match(r"^\{(.+)\}$", raw)
+    if m:
+        return m.group(1)
+    # Multiple files — take first
+    parts = raw.split()
+    return parts[0] if parts else raw
 
-    def __init__(self, parent, width: int, height: int, **kw):
-        super().__init__(
-            parent,
-            width=width, height=height,
-            bg=CARD, highlightthickness=1,
-            highlightbackground=BORDER,
-            **kw,
-        )
-        self._w = width
-        self._h = height
+
+SUPPORTED_EXT = {".png", ".jpg", ".jpeg", ".bmp", ".tiff", ".tif", ".webp"}
+
+
+def _is_image_path(path: str) -> bool:
+    return Path(path).suffix.lower() in SUPPORTED_EXT
+
+
+# ── reusable widget pieces ────────────────────────────────────────────────────
+
+def _btn(parent, text, cmd, accent=False, width=0, state="normal"):
+    bg  = ACCENT if accent else CARD
+    fg  = "#ffffff" if accent else TEXT
+    abg = ACCENT_HVR if accent else BORDER
+    kw  = dict(width=width) if width else {}
+    b = tk.Button(
+        parent, text=text, command=cmd,
+        bg=bg, fg=fg, activebackground=abg, activeforeground=fg,
+        relief="flat", bd=0, padx=14, pady=9,
+        font=("Helvetica", 10, "bold" if accent else "normal"),
+        cursor="hand2", state=state, **kw,
+    )
+    return b
+
+
+def _lbl(parent, text="", bold=False, fg=TEXT, size=10, bg=None, anchor="w", wraplength=0):
+    kw = dict(wraplength=wraplength) if wraplength else {}
+    return tk.Label(
+        parent, text=text,
+        bg=bg or PANEL, fg=fg,
+        font=("Helvetica", size, "bold" if bold else "normal"),
+        anchor=anchor, **kw,
+    )
+
+
+def _sep(parent):
+    f = tk.Frame(parent, bg=BORDER, height=1)
+    f.pack(fill="x", pady=10)
+    return f
+
+
+class ImageCanvas(tk.Canvas):
+    """Fixed-size canvas that displays a PIL image centred, or a placeholder."""
+
+    def __init__(self, parent, w, h, placeholder="Drop or open an image", **kw):
+        super().__init__(parent, width=w, height=h,
+                         bg=CARD, highlightthickness=1,
+                         highlightbackground=BORDER, **kw)
+        self._w, self._h = w, h
+        self._placeholder = placeholder
+        self._ref = None
         self._draw_placeholder()
 
     def _draw_placeholder(self):
         self.delete("all")
-        self.create_rectangle(0, 0, self._w, self._h, fill=CARD, outline="")
         cx, cy = self._w // 2, self._h // 2
-        self.create_text(cx, cy - 14, text="🖼", font=("Segoe UI Emoji", 32), fill=BORDER)
-        self.create_text(cx, cy + 22, text="No image loaded",
+        self.create_text(cx, cy - 16, text="🖼",
+                         font=("Segoe UI Emoji", 28), fill=BORDER)
+        self.create_text(cx, cy + 18, text=self._placeholder,
                          font=("Helvetica", 10), fill=SUBTEXT)
 
-    def show_image(self, pil_img: Image.Image):
-        self._img_ref = _pil_to_tk(pil_img, self._w - 4, self._h - 4)
+    def show(self, pil: Image.Image):
+        self._ref = _pil_fit(pil, self._w - 8, self._h - 8)
         self.delete("all")
-        cx, cy = self._w // 2, self._h // 2
-        self.create_image(cx, cy, anchor="center", image=self._img_ref)
+        self.create_image(self._w // 2, self._h // 2,
+                          anchor="center", image=self._ref)
 
     def reset(self):
-        self._img_ref = None
+        self._ref = None
         self._draw_placeholder()
 
 
-class StatusBar(tk.Frame):
+# ── right-side panels (stacked, one shown at a time) ─────────────────────────
+
+class _RightPanel(tk.Frame):
     def __init__(self, parent):
-        super().__init__(parent, bg=PANEL, pady=6, padx=10)
-        self._lbl = tk.Label(self, text="Ready", bg=PANEL, fg=SUBTEXT,
-                             font=("Helvetica", 10), anchor="w")
-        self._lbl.pack(fill="x")
+        super().__init__(parent, bg=CARD,
+                         highlightthickness=1, highlightbackground=BORDER)
 
-    def set(self, msg: str, kind: str = "info"):
-        colours = {"info": SUBTEXT, "ok": SUCCESS, "warn": WARNING, "error": ERROR}
-        self._lbl.config(text=msg, fg=colours.get(kind, SUBTEXT))
-        self.update_idletasks()
+    def show(self):
+        self.pack(fill="both", expand=True)
 
-
-def _styled_btn(parent, text: str, command, accent=False, width=22):
-    bg   = ACCENT if accent else CARD
-    fg   = "#ffffff" if accent else TEXT
-    abg  = ACCENT_HVR if accent else BORDER
-    btn = tk.Button(
-        parent, text=text, command=command,
-        bg=bg, fg=fg, activebackground=abg, activeforeground=fg,
-        relief="flat", bd=0, padx=12, pady=8,
-        font=("Helvetica", 10, "bold" if accent else "normal"),
-        cursor="hand2", width=width,
-    )
-    return btn
+    def hide(self):
+        self.pack_forget()
 
 
-def _label(parent, text, bold=False, colour=TEXT, size=10):
-    return tk.Label(
-        parent, text=text, bg=PANEL, fg=colour,
-        font=("Helvetica", size, "bold" if bold else "normal"),
-        anchor="w",
-    )
+class IdlePanel(_RightPanel):
+    def __init__(self, parent):
+        super().__init__(parent)
+        tk.Label(self, text="←  Drop or open an image\n    to get started",
+                 bg=CARD, fg=SUBTEXT, font=("Helvetica", 11),
+                 justify="left").pack(expand=True)
 
 
-# ── Tab: Embed ────────────────────────────────────────────────────────────────
+class LoadingPanel(_RightPanel):
+    def __init__(self, parent):
+        super().__init__(parent)
+        self._lbl = tk.Label(self, text="⏳  Analysing image…",
+                             bg=CARD, fg=SUBTEXT, font=("Helvetica", 11))
+        self._lbl.pack(expand=True)
 
-class EmbedTab(tk.Frame):
-    def __init__(self, parent, status: StatusBar):
-        super().__init__(parent, bg=PANEL)
-        self._status = status
-        self._src_path: Path | None = None
-        self._wm_array: np.ndarray | None = None  # watermarked image (BGR numpy)
+    def set_text(self, t):
+        self._lbl.config(text=t)
+
+
+class WatermarkFoundPanel(_RightPanel):
+    """Shown when a blind watermark IS detected."""
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self._qr_arr = None
         self._build()
 
     def _build(self):
-        top = tk.Frame(self, bg=PANEL, pady=8, padx=12)
-        top.pack(fill="x")
-        _label(top, "Source Image", bold=True, size=11).pack(side="left")
-        _styled_btn(top, "Open Image…", self._open, width=14).pack(side="right")
+        p = tk.Frame(self, bg=CARD, padx=18, pady=14)
+        p.pack(fill="both", expand=True)
 
-        self._path_lbl = _label(top, "No file selected", colour=SUBTEXT)
-        self._path_lbl.pack(side="left", padx=(10, 0))
+        # Badge
+        badge = tk.Frame(p, bg=SUCCESS_BG, padx=10, pady=6)
+        badge.pack(fill="x", pady=(0, 14))
+        tk.Label(badge, text="✅  Blind Watermark Detected",
+                 bg=SUCCESS_BG, fg=SUCCESS,
+                 font=("Helvetica", 11, "bold")).pack(anchor="w")
 
-        content = tk.Frame(self, bg=PANEL, padx=12, pady=4)
-        content.pack(fill="both", expand=True)
-        content.columnconfigure(0, weight=3)
-        content.columnconfigure(1, weight=1, minsize=240)
-        content.rowconfigure(0, weight=1)
+        # QR preview
+        _lbl(p, "Embedded QR Pattern", bold=True, fg=TEXT, size=10, bg=CARD).pack(anchor="w")
+        self._qr_canvas = ImageCanvas(p, 220, 220, placeholder="No QR extracted yet")
+        self._qr_canvas.pack(pady=(6, 12))
 
-        # Image preview
-        self._canvas = PlaceholderCanvas(content, 460, 360)
-        self._canvas.grid(row=0, column=0, sticky="nsew", padx=(0, 12), pady=4)
-
-        # Controls panel
-        ctrl = tk.Frame(content, bg=CARD, padx=16, pady=16,
-                        highlightthickness=1, highlightbackground=BORDER)
-        ctrl.grid(row=0, column=1, sticky="nsew", pady=4)
-
-        _label(ctrl, "Watermark Text / URL", bold=True, colour=TEXT, size=10).pack(anchor="w")
-        _label(ctrl, "This text will be encoded as a QR code\n"
-               "and invisibly embedded in the image.", colour=SUBTEXT, size=9).pack(anchor="w", pady=(2, 8))
-
-        self._text_var = tk.StringVar()
-        self._text_entry = tk.Text(ctrl, height=5, bg=BG, fg=TEXT, insertbackground=TEXT,
-                                   font=("Helvetica", 10), relief="flat",
-                                   highlightthickness=1, highlightbackground=BORDER,
-                                   wrap="word", padx=6, pady=6)
-        self._text_entry.pack(fill="x", pady=(0, 12))
-
-        self._embed_btn = _styled_btn(ctrl, "⬛  Embed Watermark", self._embed, accent=True)
-        self._embed_btn.pack(fill="x", pady=(0, 8))
-        self._embed_btn.config(state="disabled")
-
-        ttk.Separator(ctrl, orient="horizontal").pack(fill="x", pady=10)
-
-        self._export_btn = _styled_btn(ctrl, "💾  Export Watermarked Image", self._export)
-        self._export_btn.pack(fill="x")
-        self._export_btn.config(state="disabled")
-
-        self._wm_note = _label(ctrl, "", colour=SUBTEXT, size=9)
-        self._wm_note.pack(anchor="w", pady=(6, 0))
-
-    def _open(self):
-        path = filedialog.askopenfilename(
-            title="Open Image",
-            filetypes=[("Image files", "*.png *.jpg *.jpeg *.bmp *.tiff *.webp"),
-                       ("All files", "*.*")],
+        # Decoded content
+        _lbl(p, "Decoded Content", bold=True, fg=TEXT, size=10, bg=CARD).pack(anchor="w")
+        self._content_box = tk.Text(
+            p, height=4, bg=BG, fg=SUCCESS,
+            font=("Helvetica", 10), relief="flat",
+            highlightthickness=1, highlightbackground=BORDER,
+            padx=8, pady=6, wrap="word", state="disabled",
+            insertbackground=TEXT,
         )
-        if not path:
+        self._content_box.pack(fill="x", pady=(4, 14))
+
+        _sep(p)
+        self._save_btn = _btn(p, "💾  Save QR Image", self._save, state="disabled")
+        self._save_btn.pack(fill="x")
+
+    def populate(self, qr_arr: np.ndarray | None, content: str | None, src_path: Path):
+        self._qr_arr = qr_arr
+        self._src_path = src_path
+
+        if qr_arr is not None:
+            self._qr_canvas.show(Image.fromarray(qr_arr))
+            self._save_btn.config(state="normal")
+        else:
+            self._qr_canvas.reset()
+            self._save_btn.config(state="disabled")
+
+        self._content_box.config(state="normal")
+        self._content_box.delete("1.0", "end")
+        if content:
+            self._content_box.insert("end", content)
+            self._content_box.config(fg=SUCCESS)
+        else:
+            self._content_box.insert("end",
+                "(Could not auto-decode — scan the saved QR image with a reader)")
+            self._content_box.config(fg=SUBTEXT)
+        self._content_box.config(state="disabled")
+
+    def _save(self):
+        if self._qr_arr is None:
             return
-        self._src_path = Path(path)
+        default = (self._src_path.stem + "_extracted_qr.png")
+        out = filedialog.asksaveasfilename(
+            title="Save Extracted QR Image",
+            initialfile=default,
+            defaultextension=".png",
+            filetypes=[("PNG image", "*.png"), ("All files", "*.*")],
+        )
+        if out:
+            Image.fromarray(self._qr_arr).save(out)
+            messagebox.showinfo("Saved", f"QR image saved to:\n{out}")
+
+
+class NoWatermarkPanel(_RightPanel):
+    """Shown when no watermark is present — lets user add one and export."""
+
+    def __init__(self, parent, on_embed_done):
+        super().__init__(parent)
+        self._on_embed_done = on_embed_done   # callback(wm_array, src_path)
+        self._src_path: Path | None = None
+        self._wm_array: np.ndarray | None = None
+        self._build()
+
+    def _build(self):
+        p = tk.Frame(self, bg=CARD, padx=18, pady=14)
+        p.pack(fill="both", expand=True)
+
+        # Badge
+        badge = tk.Frame(p, bg=WARNING_BG, padx=10, pady=6)
+        badge.pack(fill="x", pady=(0, 14))
+        tk.Label(badge, text="⚠  No Blind Watermark Found",
+                 bg=WARNING_BG, fg=WARNING,
+                 font=("Helvetica", 11, "bold")).pack(anchor="w")
+
+        # Input
+        _lbl(p, "Add Blind QR Watermark", bold=True, fg=TEXT, size=10, bg=CARD).pack(anchor="w")
+        _lbl(p, "Enter text or URL to encode as an\ninvisible QR watermark:",
+             fg=SUBTEXT, size=9, bg=CARD).pack(anchor="w", pady=(3, 6))
+
+        self._entry = tk.Text(
+            p, height=5, bg=BG, fg=TEXT, insertbackground=TEXT,
+            font=("Helvetica", 10), relief="flat",
+            highlightthickness=1, highlightbackground=BORDER,
+            padx=8, pady=6, wrap="word",
+        )
+        self._entry.pack(fill="x", pady=(0, 10))
+
+        self._embed_btn = _btn(p, "⬛  Add Blind Watermark", self._embed, accent=True)
+        self._embed_btn.pack(fill="x")
+
+        _sep(p)
+
+        self._export_btn = _btn(p, "💾  Export Watermarked Image",
+                                self._export, state="disabled")
+        self._export_btn.pack(fill="x")
+
+        self._note = _lbl(p, "", fg=SUBTEXT, size=9, bg=CARD)
+        self._note.pack(anchor="w", pady=(8, 0))
+
+    def set_source(self, path: Path):
+        self._src_path = path
         self._wm_array = None
         self._export_btn.config(state="disabled")
-        self._wm_note.config(text="")
-
-        try:
-            pil = Image.open(path).convert("RGB")
-        except Exception as e:
-            messagebox.showerror("Error", f"Cannot open image:\n{e}")
-            return
-
-        self._canvas.show_image(pil)
-        self._path_lbl.config(text=self._src_path.name)
-
-        # Check for existing watermark and update UI accordingly
-        try:
-            if wm_core.has_watermark(path):
-                self._embed_btn.config(state="disabled")
-                self._status.set(
-                    "⚠  This image already contains a blind watermark. Embedding blocked.",
-                    "warn"
-                )
-                self._wm_note.config(
-                    text="Already watermarked — embedding not allowed.", fg=WARNING
-                )
-            else:
-                self._embed_btn.config(state="normal")
-                self._status.set("Image loaded. Enter watermark text and click Embed.", "info")
-                self._wm_note.config(text="", fg=SUBTEXT)
-        except Exception as e:
-            self._status.set(f"Error reading image: {e}", "error")
+        self._embed_btn.config(state="normal",
+                               text="⬛  Add Blind Watermark", bg=ACCENT)
+        self._note.config(text="", fg=SUBTEXT)
+        self._entry.config(state="normal")
 
     def _embed(self):
+        text = self._entry.get("1.0", "end").strip()
+        if not text:
+            messagebox.showwarning("Missing Text",
+                                   "Please enter text or URL for the watermark.")
+            return
         if self._src_path is None:
             return
-        text = self._text_entry.get("1.0", "end").strip()
-        if not text:
-            messagebox.showwarning("Missing Text", "Please enter watermark text or URL.")
-            return
 
-        self._embed_btn.config(state="disabled", text="⏳  Embedding…")
-        self._status.set("Embedding blind QR watermark…", "info")
+        self._embed_btn.config(state="disabled", text="⏳  Embedding…", bg=ACCENT_DIM)
+        self._entry.config(state="disabled")
+        self._note.config(text="", fg=SUBTEXT)
         self.update_idletasks()
 
+        src = str(self._src_path)
         def _worker():
-            import cv2, tempfile, os
             try:
                 tmp = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
-                tmp_path = tmp.name
                 tmp.close()
-
-                wm_core.embed(str(self._src_path), tmp_path, text)
-
-                arr = cv2.imread(tmp_path)
-                os.unlink(tmp_path)
-
+                wm_core.embed(src, tmp.name, text)
+                arr = cv2.imread(tmp.name)
+                os.unlink(tmp.name)
                 self.after(0, self._embed_done, arr, None)
             except Exception as e:
                 self.after(0, self._embed_done, None, str(e))
@@ -243,363 +343,295 @@ class EmbedTab(tk.Frame):
         threading.Thread(target=_worker, daemon=True).start()
 
     def _embed_done(self, arr, error):
-        self._embed_btn.config(text="⬛  Embed Watermark")
+        self._embed_btn.config(text="⬛  Add Blind Watermark")
         if error:
-            self._embed_btn.config(state="normal")
-            self._status.set(f"Error: {error}", "error")
-            messagebox.showerror("Embed Failed", error)
+            self._embed_btn.config(state="normal", bg=ACCENT)
+            self._entry.config(state="normal")
+            self._note.config(text=f"Error: {error}", fg=ERROR)
             return
 
         self._wm_array = arr
-        pil = _cv2_array_to_pil(arr)
-        self._canvas.show_image(pil)
+        self._embed_btn.config(state="disabled", bg=ACCENT_DIM)
+        self._entry.config(state="disabled")
         self._export_btn.config(state="normal")
-        self._embed_btn.config(state="disabled")   # prevent double-embed
-        self._status.set("✓  Watermark embedded successfully. Ready to export.", "ok")
-        self._wm_note.config(
-            text="Watermark embedded — image ready to export.", fg=SUCCESS
-        )
+        self._note.config(text="✓  Watermark embedded. Ready to export.", fg=SUCCESS)
+        self._on_embed_done(arr, self._src_path)
 
     def _export(self):
         if self._wm_array is None:
             return
-        default_name = self._src_path.stem + "_watermarked.png" if self._src_path else "watermarked.png"
-        out_path = filedialog.asksaveasfilename(
+        default = (self._src_path.stem + "_watermarked.png") if self._src_path else "watermarked.png"
+        out = filedialog.asksaveasfilename(
             title="Export Watermarked Image",
-            initialfile=default_name,
+            initialfile=default,
             defaultextension=".png",
-            filetypes=[("PNG image", "*.png"), ("JPEG image", "*.jpg"), ("All files", "*.*")],
-        )
-        if not out_path:
-            return
-        import cv2
-        cv2.imwrite(out_path, self._wm_array)
-        self._status.set(f"✓  Exported to {Path(out_path).name}", "ok")
-        messagebox.showinfo("Exported", f"Watermarked image saved to:\n{out_path}")
-
-
-# ── Tab: Check ────────────────────────────────────────────────────────────────
-
-class CheckTab(tk.Frame):
-    def __init__(self, parent, status: StatusBar):
-        super().__init__(parent, bg=PANEL)
-        self._status = status
-        self._src_path: Path | None = None
-        self._build()
-
-    def _build(self):
-        top = tk.Frame(self, bg=PANEL, pady=8, padx=12)
-        top.pack(fill="x")
-        _label(top, "Detect Watermark", bold=True, size=11).pack(side="left")
-        _styled_btn(top, "Open Image…", self._open, width=14).pack(side="right")
-        self._path_lbl = _label(top, "No file selected", colour=SUBTEXT)
-        self._path_lbl.pack(side="left", padx=(10, 0))
-
-        content = tk.Frame(self, bg=PANEL, padx=12, pady=4)
-        content.pack(fill="both", expand=True)
-        content.columnconfigure(0, weight=3)
-        content.columnconfigure(1, weight=1, minsize=240)
-        content.rowconfigure(0, weight=1)
-
-        self._canvas = PlaceholderCanvas(content, 460, 360)
-        self._canvas.grid(row=0, column=0, sticky="nsew", padx=(0, 12), pady=4)
-
-        ctrl = tk.Frame(content, bg=CARD, padx=16, pady=16,
-                        highlightthickness=1, highlightbackground=BORDER)
-        ctrl.grid(row=0, column=1, sticky="nsew", pady=4)
-
-        _label(ctrl, "Watermark Detection", bold=True).pack(anchor="w", pady=(0, 6))
-        _label(ctrl, "Checks whether this image already\n"
-               "contains a blind QR watermark.", colour=SUBTEXT, size=9).pack(anchor="w", pady=(0, 16))
-
-        self._check_btn = _styled_btn(ctrl, "🔍  Check Watermark", self._check, accent=True)
-        self._check_btn.pack(fill="x")
-        self._check_btn.config(state="disabled")
-
-        ttk.Separator(ctrl, orient="horizontal").pack(fill="x", pady=16)
-
-        # Result badge
-        self._result_frame = tk.Frame(ctrl, bg=CARD)
-        self._result_frame.pack(fill="x")
-        self._result_icon = _label(self._result_frame, "", size=28, colour=SUBTEXT)
-        self._result_icon.pack()
-        self._result_lbl = _label(self._result_frame, "—", colour=SUBTEXT, bold=True, size=11)
-        self._result_lbl.pack()
-        self._result_sub = _label(self._result_frame, "", colour=SUBTEXT, size=9)
-        self._result_sub.pack(pady=(4, 0))
-
-    def _open(self):
-        path = filedialog.askopenfilename(
-            title="Open Image",
-            filetypes=[("Image files", "*.png *.jpg *.jpeg *.bmp *.tiff *.webp"),
+            filetypes=[("PNG image", "*.png"),
+                       ("JPEG image", "*.jpg"),
                        ("All files", "*.*")],
         )
-        if not path:
+        if not out:
             return
-        self._src_path = Path(path)
-        self._result_icon.config(text="", fg=SUBTEXT)
-        self._result_lbl.config(text="—", fg=SUBTEXT)
-        self._result_sub.config(text="")
-        try:
-            pil = Image.open(path).convert("RGB")
-        except Exception as e:
-            messagebox.showerror("Error", f"Cannot open image:\n{e}")
-            return
-        self._canvas.show_image(pil)
-        self._path_lbl.config(text=self._src_path.name)
-        self._check_btn.config(state="normal")
-        self._status.set("Image loaded. Click Check Watermark.", "info")
+        cv2.imwrite(out, self._wm_array)
+        messagebox.showinfo("Exported", f"Watermarked image saved to:\n{out}")
 
-    def _check(self):
-        if not self._src_path:
-            return
-        self._check_btn.config(state="disabled", text="⏳  Checking…")
-        self._status.set("Checking for blind watermark…", "info")
-        self.update_idletasks()
 
-        def _worker():
-            try:
-                result = wm_core.has_watermark(str(self._src_path))
-                self.after(0, self._check_done, result, None)
-            except Exception as e:
-                self.after(0, self._check_done, None, str(e))
+# ── drop zone ─────────────────────────────────────────────────────────────────
 
-        threading.Thread(target=_worker, daemon=True).start()
+class DropZone(tk.Canvas):
+    """Large dashed-border drop target shown before any image is loaded."""
 
-    def _check_done(self, result, error):
-        self._check_btn.config(state="normal", text="🔍  Check Watermark")
-        if error:
-            self._status.set(f"Error: {error}", "error")
-            return
-        if result:
-            self._result_icon.config(text="✅", fg=SUCCESS)
-            self._result_lbl.config(text="Watermark Found", fg=SUCCESS)
-            self._result_sub.config(
-                text="This image contains\na blind QR watermark.", fg=SUBTEXT
-            )
-            self._status.set("✓  Blind watermark detected in this image.", "ok")
+    def __init__(self, parent, on_file, **kw):
+        super().__init__(parent, bg=PANEL, highlightthickness=0, **kw)
+        self._on_file = on_file
+        self._draw()
+        self.bind("<Button-1>", self._browse)
+        self.bind("<Enter>",    lambda e: self._draw(hover=True))
+        self.bind("<Leave>",    lambda e: self._draw(hover=False))
+        if _DND_AVAILABLE:
+            self.drop_target_register(DND_FILES)
+            self.dnd_bind("<<Drop>>", self._on_drop)
+            self.dnd_bind("<<DragEnter>>", lambda e: self._draw(hover=True))
+            self.dnd_bind("<<DragLeave>>", lambda e: self._draw(hover=False))
+
+    def _draw(self, hover=False):
+        self.delete("all")
+        w, h = self.winfo_reqwidth(), self.winfo_reqheight()
+        if w < 10:
+            w, h = 560, 340
+        border_col = DROP_HL if hover else BORDER
+        # Dashed border via segments
+        dash = 10
+        for x in range(0, w, dash * 2):
+            self.create_line(x, 4, min(x + dash, w), 4,
+                             fill=border_col, width=2)
+            self.create_line(x, h - 4, min(x + dash, w), h - 4,
+                             fill=border_col, width=2)
+        for y in range(0, h, dash * 2):
+            self.create_line(4, y, 4, min(y + dash, h),
+                             fill=border_col, width=2)
+            self.create_line(w - 4, y, w - 4, min(y + dash, h),
+                             fill=border_col, width=2)
+        cx, cy = w // 2, h // 2
+        icon_col = DROP_HL if hover else SUBTEXT
+        self.create_text(cx, cy - 38, text="⬇",
+                         font=("Helvetica", 36, "bold"), fill=icon_col)
+        self.create_text(cx, cy + 14,
+                         text="Drop image here  or  click to browse",
+                         font=("Helvetica", 13), fill=TEXT if hover else SUBTEXT)
+        self.create_text(cx, cy + 38,
+                         text="PNG · JPG · JPEG · BMP · TIFF",
+                         font=("Helvetica", 9), fill=SUBTEXT)
+
+    def _browse(self, _=None):
+        path = filedialog.askopenfilename(
+            title="Open Image",
+            filetypes=[
+                ("Image files", "*.png *.jpg *.jpeg *.bmp *.tiff *.tif *.webp"),
+                ("All files", "*.*"),
+            ],
+        )
+        if path:
+            self._on_file(path)
+
+    def _on_drop(self, event):
+        self._draw(hover=False)
+        path = _parse_dnd_path(event.data)
+        if _is_image_path(path):
+            self._on_file(path)
         else:
-            self._result_icon.config(text="❌", fg=ERROR)
-            self._result_lbl.config(text="No Watermark", fg=ERROR)
-            self._result_sub.config(
-                text="No blind watermark\nwas found in this image.", fg=SUBTEXT
-            )
-            self._status.set("No blind watermark found in this image.", "info")
+            messagebox.showwarning("Unsupported File",
+                                   f"Only image files are supported.\nDropped: {path}")
 
 
-# ── Tab: Extract ──────────────────────────────────────────────────────────────
+# ── main window ───────────────────────────────────────────────────────────────
 
-class ExtractTab(tk.Frame):
-    def __init__(self, parent, status: StatusBar):
-        super().__init__(parent, bg=PANEL)
-        self._status = status
+class App(TkinterDnD.Tk if _DND_AVAILABLE else tk.Tk):
+
+    def __init__(self):
+        super().__init__()
+        self.title("盲水印QR  ·  Blind QR Watermark Tool")
+        self.geometry("900x580")
+        self.minsize(720, 480)
+        self.configure(bg=PANEL)
         self._src_path: Path | None = None
-        self._qr_array: np.ndarray | None = None
         self._build()
 
+    # ── layout ────────────────────────────────────────────────────────────────
+
     def _build(self):
-        top = tk.Frame(self, bg=PANEL, pady=8, padx=12)
-        top.pack(fill="x")
-        _label(top, "Extract Watermark QR", bold=True, size=11).pack(side="left")
-        _styled_btn(top, "Open Image…", self._open, width=14).pack(side="right")
-        self._path_lbl = _label(top, "No file selected", colour=SUBTEXT)
-        self._path_lbl.pack(side="left", padx=(10, 0))
+        # ── header ──────────────────────────────────────────────────────
+        hdr = tk.Frame(self, bg=ACCENT, padx=18, pady=10)
+        hdr.pack(fill="x")
+        tk.Label(hdr, text="盲水印QR  Blind QR Watermark Tool",
+                 bg=ACCENT, fg="#ffffff",
+                 font=("Helvetica", 14, "bold")).pack(side="left")
+        tk.Label(hdr,
+                 text="Invisible QR watermarks — drop an image to begin",
+                 bg=ACCENT, fg="#cdc8ff",
+                 font=("Helvetica", 9)).pack(side="left", padx=(14, 0))
 
-        content = tk.Frame(self, bg=PANEL, padx=12, pady=4)
-        content.pack(fill="both", expand=True)
-        content.columnconfigure(0, weight=2)
-        content.columnconfigure(1, weight=2)
-        content.rowconfigure(0, weight=1)
+        # ── status bar ───────────────────────────────────────────────────
+        self._status_lbl = tk.Label(self, text="Ready — drag & drop or click to open an image",
+                                    bg=BG, fg=SUBTEXT,
+                                    font=("Helvetica", 9), anchor="w",
+                                    padx=12, pady=5)
+        self._status_lbl.pack(side="bottom", fill="x")
+        tk.Frame(self, bg=BORDER, height=1).pack(side="bottom", fill="x")
 
-        # Source image
-        left = tk.Frame(content, bg=PANEL)
-        left.grid(row=0, column=0, sticky="nsew", padx=(0, 6), pady=4)
-        _label(left, "Source Image", colour=SUBTEXT, size=9).pack(anchor="w", pady=(0, 4))
-        self._src_canvas = PlaceholderCanvas(left, 360, 320)
-        self._src_canvas.pack(fill="both", expand=True)
+        # ── toolbar (shown once image loaded) ────────────────────────────
+        self._toolbar = tk.Frame(self, bg=PANEL, padx=12, pady=6)
+        # (packed dynamically)
+        self._file_lbl = _lbl(self._toolbar, "", fg=SUBTEXT, size=9, bg=PANEL)
+        self._file_lbl.pack(side="left")
+        _btn(self._toolbar, "↩  Load Another Image", self._reset, width=22).pack(side="right")
 
-        self._extract_btn = _styled_btn(left, "🔓  Extract QR Watermark", self._extract, accent=True)
-        self._extract_btn.pack(fill="x", pady=(8, 0))
-        self._extract_btn.config(state="disabled")
+        # ── body ────────────────────────────────────────────────────────
+        body = tk.Frame(self, bg=PANEL)
+        body.pack(fill="both", expand=True, padx=12, pady=(8, 8))
+        body.columnconfigure(0, weight=3)
+        body.columnconfigure(1, weight=2, minsize=260)
+        body.rowconfigure(0, weight=1)
 
-        # Extracted QR
-        right = tk.Frame(content, bg=PANEL)
-        right.grid(row=0, column=1, sticky="nsew", padx=(6, 0), pady=4)
-        _label(right, "Extracted QR Code", colour=SUBTEXT, size=9).pack(anchor="w", pady=(0, 4))
-        self._qr_canvas = PlaceholderCanvas(right, 360, 320)
-        self._qr_canvas.pack(fill="both", expand=True)
+        # Left: drop zone / image preview
+        left = tk.Frame(body, bg=PANEL)
+        left.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
 
-        self._save_btn = _styled_btn(right, "💾  Save QR Image", self._save_qr)
-        self._save_btn.pack(fill="x", pady=(8, 0))
-        self._save_btn.config(state="disabled")
+        self._drop_zone = DropZone(left, self._load_file,
+                                   width=520, height=400)
+        self._drop_zone.pack(fill="both", expand=True)
 
-        self._content_lbl = _label(right, "", colour=SUBTEXT, size=9)
-        self._content_lbl.pack(anchor="w", pady=(6, 0))
+        self._img_canvas = ImageCanvas(left, 520, 400,
+                                       placeholder="Image preview")
+        # (shown when image loaded)
 
-    def _open(self):
-        path = filedialog.askopenfilename(
-            title="Open Image",
-            filetypes=[("Image files", "*.png *.jpg *.jpeg *.bmp *.tiff *.webp"),
-                       ("All files", "*.*")],
-        )
-        if not path:
+        # Right: stacked panels
+        right = tk.Frame(body, bg=PANEL)
+        right.grid(row=0, column=1, sticky="nsew")
+
+        self._idle_panel    = IdlePanel(right)
+        self._loading_panel = LoadingPanel(right)
+        self._found_panel   = WatermarkFoundPanel(right)
+        self._none_panel    = NoWatermarkPanel(right, self._on_embed_done)
+
+        self._idle_panel.show()
+
+    # ── state transitions ─────────────────────────────────────────────────────
+
+    def _set_status(self, msg, colour=SUBTEXT):
+        self._status_lbl.config(text=msg, fg=colour)
+        self.update_idletasks()
+
+    def _show_panel(self, panel):
+        for p in (self._idle_panel, self._loading_panel,
+                  self._found_panel, self._none_panel):
+            p.hide()
+        panel.show()
+
+    def _reset(self):
+        self._src_path = None
+        self._img_canvas.pack_forget()
+        self._drop_zone.pack(fill="both", expand=True)
+        self._toolbar.pack_forget()
+        self._show_panel(self._idle_panel)
+        self._set_status("Ready — drag & drop or click to open an image")
+
+    def _load_file(self, path: str):
+        path = path.strip()
+        if not os.path.isfile(path):
+            messagebox.showerror("Not Found", f"File not found:\n{path}")
             return
-        self._src_path = Path(path)
-        self._qr_array = None
-        self._save_btn.config(state="disabled")
-        self._content_lbl.config(text="")
-        self._qr_canvas.reset()
         try:
             pil = Image.open(path).convert("RGB")
         except Exception as e:
             messagebox.showerror("Error", f"Cannot open image:\n{e}")
             return
-        self._src_canvas.show_image(pil)
-        self._path_lbl.config(text=self._src_path.name)
-        self._extract_btn.config(state="normal")
-        self._status.set("Image loaded. Click Extract QR Watermark.", "info")
 
-    def _extract(self):
-        if not self._src_path:
-            return
-        self._extract_btn.config(state="disabled", text="⏳  Extracting…")
-        self._status.set("Extracting blind QR watermark…", "info")
-        self.update_idletasks()
+        self._src_path = Path(path)
 
-        def _worker():
-            import cv2, tempfile, os
-            try:
-                img = cv2.imread(str(self._src_path))
-                if img is None:
-                    raise ValueError("Cannot read image file.")
+        # Switch to image view
+        self._drop_zone.pack_forget()
+        self._img_canvas.show(pil)
+        self._img_canvas.pack(fill="both", expand=True)
 
-                if not wm_core._read_marker(img):
-                    self.after(0, self._extract_done, None, None, "no_watermark")
-                    return
+        self._toolbar.pack(fill="x", before=self._status_lbl)
+        self._file_lbl.config(text=f"  {self._src_path.name}")
 
+        self._show_panel(self._loading_panel)
+        self._loading_panel.set_text("⏳  Checking for blind watermark…")
+        self._set_status(f"Analysing: {self._src_path.name}")
+
+        threading.Thread(target=self._analyse, args=(path,), daemon=True).start()
+
+    def _analyse(self, path: str):
+        try:
+            img = cv2.imread(path)
+            if img is None:
+                raise ValueError("Cannot read image data.")
+
+            has_wm = wm_core._read_marker(img)
+
+            if has_wm:
+                # Extract QR
                 gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
                 qr_arr = wm_core._extract_qr_dft(gray)
 
-                # Try to decode QR content
+                # Try to decode
                 content = None
                 try:
                     from pyzbar.pyzbar import decode as pyzbar_decode
-                    decoded = pyzbar_decode(Image.fromarray(qr_arr))
+                    pil_qr = Image.fromarray(qr_arr)
+                    decoded = pyzbar_decode(pil_qr)
                     if not decoded:
                         decoded = pyzbar_decode(Image.fromarray(255 - qr_arr))
                     if decoded:
                         content = decoded[0].data.decode("utf-8", errors="replace")
                 except ImportError:
-                    content = "(install pyzbar to auto-decode QR content)"
+                    content = None
 
-                self.after(0, self._extract_done, qr_arr, content, None)
-            except Exception as e:
-                self.after(0, self._extract_done, None, None, str(e))
+                self.after(0, self._show_found, qr_arr, content)
+            else:
+                self.after(0, self._show_none)
 
-        threading.Thread(target=_worker, daemon=True).start()
+        except Exception as e:
+            self.after(0, self._show_error, str(e))
 
-    def _extract_done(self, qr_arr, content, error):
-        self._extract_btn.config(state="normal", text="🔓  Extract QR Watermark")
-        if error == "no_watermark":
-            self._status.set("No blind watermark detected in this image.", "warn")
-            messagebox.showinfo("No Watermark", "This image does not contain a blind QR watermark.")
-            return
-        if error:
-            self._status.set(f"Error: {error}", "error")
-            messagebox.showerror("Extraction Failed", str(error))
-            return
-
-        self._qr_array = qr_arr
-        pil = Image.fromarray(qr_arr)
-        self._qr_canvas.show_image(pil)
-        self._save_btn.config(state="normal")
-
+    def _show_found(self, qr_arr, content):
+        self._found_panel.populate(qr_arr, content, self._src_path)
+        self._show_panel(self._found_panel)
+        msg = f"✓  Watermark found in {self._src_path.name}"
         if content:
-            self._content_lbl.config(
-                text=f"QR Content:\n{content[:80]}{'…' if len(content) > 80 else ''}",
-                fg=SUCCESS,
-            )
-            self._status.set(f"✓  QR extracted. Content: {content[:60]}", "ok")
-        else:
-            self._content_lbl.config(
-                text="QR extracted. Use a scanner to read the content.", fg=SUBTEXT
-            )
-            self._status.set("✓  QR watermark pattern extracted successfully.", "ok")
+            short = content[:60] + ("…" if len(content) > 60 else "")
+            msg += f"  ·  {short}"
+        self._set_status(msg, SUCCESS)
 
-    def _save_qr(self):
-        if self._qr_array is None:
-            return
-        default_name = (self._src_path.stem + "_extracted_qr.png") if self._src_path else "extracted_qr.png"
-        out_path = filedialog.asksaveasfilename(
-            title="Save Extracted QR Image",
-            initialfile=default_name,
-            defaultextension=".png",
-            filetypes=[("PNG image", "*.png"), ("All files", "*.*")],
+    def _show_none(self):
+        self._none_panel.set_source(self._src_path)
+        self._show_panel(self._none_panel)
+        self._set_status(
+            f"No watermark in {self._src_path.name}  — enter text below to add one.",
+            WARNING,
         )
-        if not out_path:
-            return
-        Image.fromarray(self._qr_array).save(out_path)
-        self._status.set(f"✓  QR image saved to {Path(out_path).name}", "ok")
-        messagebox.showinfo("Saved", f"Extracted QR image saved to:\n{out_path}")
+
+    def _show_error(self, err):
+        self._show_panel(self._idle_panel)
+        self._set_status(f"Error: {err}", ERROR)
+        messagebox.showerror("Error", err)
+
+    def _on_embed_done(self, wm_array, src_path):
+        """Called by NoWatermarkPanel after successful embedding."""
+        pil = _bgr_to_pil(wm_array)
+        self._img_canvas.show(pil)
+        self._set_status(
+            f"✓  Blind watermark embedded in {src_path.name}  — export to save.",
+            SUCCESS,
+        )
 
 
-# ── Main window ───────────────────────────────────────────────────────────────
-
-class App(tk.Tk):
-    def __init__(self):
-        super().__init__()
-        self.title("盲水印QR  ·  Blind QR Watermark Tool")
-        self.geometry("820x600")
-        self.minsize(700, 520)
-        self.configure(bg=BG)
-        self._build()
-
-    def _build(self):
-        # Header
-        header = tk.Frame(self, bg=ACCENT, padx=18, pady=10)
-        header.pack(fill="x")
-        tk.Label(
-            header, text="盲水印QR  Blind QR Watermark Tool",
-            bg=ACCENT, fg="#ffffff", font=("Helvetica", 14, "bold"),
-        ).pack(side="left")
-        tk.Label(
-            header,
-            text="Invisible QR watermarks — embed · detect · extract",
-            bg=ACCENT, fg="#d8d0ff", font=("Helvetica", 9),
-        ).pack(side="left", padx=(14, 0))
-
-        # Status bar
-        self._status = StatusBar(self)
-        self._status.pack(side="bottom", fill="x")
-        ttk.Separator(self, orient="horizontal").pack(side="bottom", fill="x")
-
-        # Notebook (tabs)
-        style = ttk.Style(self)
-        style.theme_use("default")
-        style.configure("App.TNotebook",
-                         background=BG, borderwidth=0, tabmargins=[0, 0, 0, 0])
-        style.configure("App.TNotebook.Tab",
-                         background=PANEL, foreground=SUBTEXT,
-                         padding=[18, 8], font=("Helvetica", 10),
-                         borderwidth=0)
-        style.map("App.TNotebook.Tab",
-                  background=[("selected", PANEL)],
-                  foreground=[("selected", TEXT)],
-                  expand=[("selected", [0, 0, 0, 2])])
-
-        nb = ttk.Notebook(self, style="App.TNotebook")
-        nb.pack(fill="both", expand=True, padx=0, pady=0)
-
-        self._embed_tab   = EmbedTab(nb, self._status)
-        self._check_tab   = CheckTab(nb, self._status)
-        self._extract_tab = ExtractTab(nb, self._status)
-
-        nb.add(self._embed_tab,   text="  ⬛  Embed Watermark  ")
-        nb.add(self._check_tab,   text="  🔍  Detect Watermark  ")
-        nb.add(self._extract_tab, text="  🔓  Extract QR  ")
-
+# ── entry point ───────────────────────────────────────────────────────────────
 
 def main():
+    if not _DND_AVAILABLE:
+        print("Note: tkinterdnd2 not found — drag-and-drop disabled; use click-to-browse.")
     app = App()
     app.mainloop()
 
