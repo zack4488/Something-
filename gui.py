@@ -197,10 +197,15 @@ class WatermarkFoundPanel(_RightPanel):
 
         # Badge
         badge = tk.Frame(p, bg=SUCCESS_BG, padx=10, pady=6)
-        badge.pack(fill="x", pady=(0, 14))
+        badge.pack(fill="x", pady=(0, 10))
         tk.Label(badge, text="✅  Blind Watermark Detected",
                  bg=SUCCESS_BG, fg=SUCCESS,
                  font=("Helvetica", 11, "bold")).pack(anchor="w")
+        self._cam_hint = tk.Label(badge,
+                 text="",
+                 bg=SUCCESS_BG, fg=WARNING,
+                 font=("Helvetica", 8), anchor="w")
+        self._cam_hint.pack(anchor="w")
 
         # QR preview
         _lbl(p, "Embedded QR Pattern", bold=True, fg=TEXT, size=10, bg=CARD).pack(anchor="w")
@@ -222,9 +227,17 @@ class WatermarkFoundPanel(_RightPanel):
         self._save_btn = _btn(p, "💾  Save QR Image", self._save, state="disabled")
         self._save_btn.pack(fill="x")
 
-    def populate(self, qr_arr: np.ndarray | None, content: str | None, src_path: Path):
+    def populate(self, qr_arr: np.ndarray | None, content: str | None,
+                 src_path: Path, camera_mode: bool = False):
         self._qr_arr = qr_arr
         self._src_path = src_path
+
+        if camera_mode:
+            self._cam_hint.config(
+                text="📷  Camera / Screenshot Mode active — pre-processing applied"
+            )
+        else:
+            self._cam_hint.config(text="")
 
         if qr_arr is not None:
             self._qr_canvas.show(Image.fromarray(qr_arr))
@@ -450,10 +463,11 @@ class App(TkinterDnD.Tk if _DND_AVAILABLE else tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("盲水印QR  ·  Blind QR Watermark Tool")
-        self.geometry("900x580")
-        self.minsize(720, 480)
+        self.geometry("900x600")
+        self.minsize(720, 500)
         self.configure(bg=PANEL)
         self._src_path: Path | None = None
+        self._camera_mode = tk.BooleanVar(value=False)
         self._build()
 
     # ── layout ────────────────────────────────────────────────────────────────
@@ -484,6 +498,25 @@ class App(TkinterDnD.Tk if _DND_AVAILABLE else tk.Tk):
         self._file_lbl = _lbl(self._toolbar, "", fg=SUBTEXT, size=9, bg=PANEL)
         self._file_lbl.pack(side="left")
         _btn(self._toolbar, "↩  Load Another Image", self._reset, width=22).pack(side="right")
+
+        # Camera-mode toggle — re-analyses with extra pre-processing
+        cam_chk = tk.Checkbutton(
+            self._toolbar,
+            text="📷  Camera / Screenshot Mode",
+            variable=self._camera_mode,
+            command=self._on_camera_mode_toggle,
+            bg=PANEL, fg=TEXT, selectcolor=CARD,
+            activebackground=PANEL, activeforeground=TEXT,
+            font=("Helvetica", 9), cursor="hand2",
+        )
+        cam_chk.pack(side="right", padx=(0, 16))
+
+        cam_tip = _lbl(
+            self._toolbar,
+            "Enable if image was captured by camera or screenshot",
+            fg=SUBTEXT, size=8, bg=PANEL,
+        )
+        cam_tip.pack(side="right", padx=(0, 4))
 
         # ── body ────────────────────────────────────────────────────────
         body = tk.Frame(self, bg=PANEL)
@@ -560,33 +593,37 @@ class App(TkinterDnD.Tk if _DND_AVAILABLE else tk.Tk):
         self._loading_panel.set_text("⏳  Checking for blind watermark…")
         self._set_status(f"Analysing: {self._src_path.name}")
 
-        threading.Thread(target=self._analyse, args=(path,), daemon=True).start()
+        cam = self._camera_mode.get()
+        threading.Thread(target=self._analyse, args=(path, cam), daemon=True).start()
 
-    def _analyse(self, path: str):
+    def _on_camera_mode_toggle(self):
+        """Re-run analysis when the user flips the Camera Mode switch."""
+        if self._src_path is not None:
+            self._load_file(str(self._src_path))
+
+    def _analyse(self, path: str, camera_mode: bool):
         try:
             img = cv2.imread(path)
             if img is None:
                 raise ValueError("Cannot read image data.")
 
-            has_wm = wm_core._read_marker(img)
+            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY).astype(np.float64)
+            has_wm = wm_core.has_watermark(path, camera_mode=camera_mode)
 
             if has_wm:
-                # Extract QR
-                gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-                qr_arr = wm_core._extract_qr_dft(gray)
+                qr_arr = wm_core._extract_qr_arr(gray, camera_mode=camera_mode)
 
-                # Try to decode
                 content = None
-                try:
-                    from pyzbar.pyzbar import decode as pyzbar_decode
-                    pil_qr = Image.fromarray(qr_arr)
-                    decoded = pyzbar_decode(pil_qr)
-                    if not decoded:
-                        decoded = pyzbar_decode(Image.fromarray(255 - qr_arr))
-                    if decoded:
-                        content = decoded[0].data.decode("utf-8", errors="replace")
-                except ImportError:
-                    content = None
+                if qr_arr is not None:
+                    try:
+                        from pyzbar.pyzbar import decode as pyzbar_decode
+                        for polarity in (qr_arr, 255 - qr_arr):
+                            decoded = pyzbar_decode(Image.fromarray(polarity))
+                            if decoded:
+                                content = decoded[0].data.decode("utf-8", errors="replace")
+                                break
+                    except ImportError:
+                        content = None
 
                 self.after(0, self._show_found, qr_arr, content)
             else:
@@ -596,7 +633,10 @@ class App(TkinterDnD.Tk if _DND_AVAILABLE else tk.Tk):
             self.after(0, self._show_error, str(e))
 
     def _show_found(self, qr_arr, content):
-        self._found_panel.populate(qr_arr, content, self._src_path)
+        self._found_panel.populate(
+            qr_arr, content, self._src_path,
+            camera_mode=self._camera_mode.get()
+        )
         self._show_panel(self._found_panel)
         msg = f"✓  Watermark found in {self._src_path.name}"
         if content:

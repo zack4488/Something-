@@ -1,81 +1,70 @@
 #!/usr/bin/env python3
 """
 Blind QR Watermark Tool (盲水印QR)
-Embeds an invisible QR code into images using DFT frequency-domain technique.
-Presence is flagged with an LSB marker so re-watermarking is blocked.
+
+Embedding technique: 2-level Haar DWT — QR and PN signature are added
+to the LL2 (lowest-frequency) subband so the mark survives JPEG
+compression, screen capture, and moderate camera capture.
+
+Detection uses spread-spectrum PN correlation (no pixel-exact marker),
+which is robust to any processing that preserves low-frequency structure.
+
+Watermark removal is intentionally not provided.
 """
 
 import sys
 import argparse
-import struct
+import io
 import numpy as np
 import cv2
+import pywt
 import qrcode
 from PIL import Image
-import io
+from scipy.ndimage import uniform_filter
 
-# ── constants ────────────────────────────────────────────────────────────────
-EMBED_ALPHA = 36.0          # DFT embedding strength
-MAGIC = b"\xBF\xA5\x3C\xD9\xE7\x12\x6B\x4F"   # 8-byte presence marker
-MARKER_PIXEL_STEP = 17      # stride between marker pixels (prime, avoids aliasing)
+# ── tunable constants ─────────────────────────────────────────────────────────
+WAVELET       = "haar"   # Haar for exact-size IDWT; robust LL subband
+DWT_LEVELS    = 2        # two levels → LL2 at 1/4 image size
+QR_ALPHA      = 48.0     # QR embedding strength in LL2
+SIG_ALPHA     = 32.0     # PN-signature strength in LL2
+SIG_SEED      = 0x6D616E # fixed seed ("man" in hex, for 盲 watermark)
+DETECT_THRESH = 10.0     # correlation threshold; ~0 for clean, ~SIG_ALPHA for watermarked
 
-# ── LSB presence marker ───────────────────────────────────────────────────────
+# ── DWT helpers ───────────────────────────────────────────────────────────────
 
-def _marker_positions(h: int, w: int) -> list[tuple[int, int]]:
-    """64 fixed pixel positions for the 8-byte (64-bit) LSB presence marker."""
-    positions = []
-    idx = 0
-    for i in range(64):
-        row = (idx * MARKER_PIXEL_STEP) % h
-        col = (idx * MARKER_PIXEL_STEP * 3) % w
-        positions.append((row, col))
-        idx += 1
-    return positions
+def _dwt2_levels(gray: np.ndarray):
+    """Return (LL2, subbands_L2, subbands_L1) for a grayscale float array."""
+    ll1, (lh1, hl1, hh1) = pywt.dwt2(gray, WAVELET)
+    ll2, (lh2, hl2, hh2) = pywt.dwt2(ll1, WAVELET)
+    return ll2, (lh2, hl2, hh2), (lh1, hl1, hh1), ll1.shape
 
 
-def _write_marker(img: np.ndarray) -> np.ndarray:
-    out = img.copy()
-    h, w = img.shape[:2]
-    channel = 0  # R channel (or single channel for grayscale)
-    bits = []
-    for byte in MAGIC:
-        for bit_idx in range(8):
-            bits.append((byte >> bit_idx) & 1)
-    for i, (r, c) in enumerate(_marker_positions(h, w)):
-        if len(out.shape) == 3:
-            pixel = out[r, c, channel]
-        else:
-            pixel = out[r, c]
-        pixel = (int(pixel) & 0xFE) | bits[i]
-        if len(out.shape) == 3:
-            out[r, c, channel] = pixel
-        else:
-            out[r, c] = pixel
-    return out
+def _idwt2_levels(ll2, subbands_l2, subbands_l1, ll1_shape):
+    """Reconstruct a grayscale float array from modified LL2."""
+    ll1_wm = pywt.idwt2((ll2, subbands_l2), WAVELET)
+    # Crop back to the expected LL1 shape (Haar is exact, but guard anyway)
+    h, w = ll1_shape
+    ll1_wm = ll1_wm[:h, :w]
+    gray_wm = pywt.idwt2((ll1_wm, subbands_l1), WAVELET)
+    return gray_wm
 
 
-def _read_marker(img: np.ndarray) -> bool:
-    h, w = img.shape[:2]
-    channel = 0
-    bits = []
-    for r, c in _marker_positions(h, w):
-        if len(img.shape) == 3:
-            bits.append(int(img[r, c, channel]) & 1)
-        else:
-            bits.append(int(img[r, c]) & 1)
-    recovered = []
-    for byte_i in range(8):
-        byte = 0
-        for bit_i in range(8):
-            byte |= bits[byte_i * 8 + bit_i] << bit_i
-        recovered.append(byte)
-    return bytes(recovered) == MAGIC
+# ── PN signature ──────────────────────────────────────────────────────────────
+
+def _pn_sequence(shape: tuple) -> np.ndarray:
+    """Fixed pseudo-random ±1 sequence tied to the secret seed."""
+    rng = np.random.default_rng(SIG_SEED)
+    return rng.choice([-1.0, 1.0], size=shape).astype(np.float64)
 
 
 # ── QR helpers ────────────────────────────────────────────────────────────────
 
 def _make_qr_array(text: str, h: int, w: int) -> np.ndarray:
-    """Generate a QR code (float64, 0.0=white 1.0=black) resized to (h,w)."""
+    """
+    Generate a QR code (float64, 0=white 1=black) sized to (h, w).
+    Uses H error-correction (30 % recoverable) and minimum version to
+    keep cells as large as possible (better blur robustness).
+    """
     qr = qrcode.QRCode(
         version=None,
         error_correction=qrcode.constants.ERROR_CORRECT_H,
@@ -89,190 +78,222 @@ def _make_qr_array(text: str, h: int, w: int) -> np.ndarray:
     pil.save(buf, format="PNG")
     buf.seek(0)
     arr = np.array(Image.open(buf).convert("L"), dtype=np.float64)
-    arr = (arr < 128).astype(np.float64)          # 1 = black, 0 = white
+    arr = (arr < 128).astype(np.float64)   # 1=black, 0=white
     return cv2.resize(arr, (w, h), interpolation=cv2.INTER_NEAREST)
 
 
-# ── DFT watermark embed / extract ────────────────────────────────────────────
+# ── camera / screenshot pre-processing ───────────────────────────────────────
 
-def _embed_qr_dft(gray: np.ndarray, qr_arr: np.ndarray) -> np.ndarray:
+def _preprocess_for_detection(gray: np.ndarray) -> np.ndarray:
     """
-    Add qr_arr to the DFT magnitude of gray.
-    Symmetric embedding keeps IFFT approximately real.
+    Normalise an image that may have been captured by a camera or
+    screenshot tool.  CLAHE corrects uneven lighting; mild denoise
+    reduces sensor noise; mild sharpening partially reverses lens blur.
     """
-    dft = np.fft.fft2(gray)
-    dft_shift = np.fft.fftshift(dft)
-
-    magnitude = np.abs(dft_shift)
-    phase = np.angle(dft_shift)
-
-    wm = qr_arr * EMBED_ALPHA
-    magnitude_wm = magnitude + wm + wm[::-1, ::-1]   # symmetric
-
-    dft_wm = magnitude_wm * np.exp(1j * phase)
-    img_wm = np.real(np.fft.ifft2(np.fft.ifftshift(dft_wm)))
-    return np.clip(img_wm, 0, 255).astype(np.uint8)
-
-
-def _extract_qr_dft(gray_wm: np.ndarray) -> np.ndarray:
-    """
-    Recover the embedded QR from the DFT magnitude.
-    Returns a normalized grayscale image of the extracted pattern.
-    """
-    dft = np.fft.fft2(gray_wm.astype(np.float64))
-    dft_shift = np.fft.fftshift(dft)
-    magnitude = np.abs(dft_shift)
-
-    h, w = magnitude.shape
-    cy, cx = h // 2, w // 2
-
-    # Remove DC region (bright centre blob) before analysis
-    mag_ndc = magnitude.copy()
-    dc_r, dc_c = max(1, h // 20), max(1, w // 20)
-    mag_ndc[cy - dc_r : cy + dc_r, cx - dc_c : cx + dc_c] = 0
-
-    # Approximate the background spectrum with a large median filter and subtract
-    # to reveal the structured QR signature above the smooth background
-    from scipy.ndimage import uniform_filter
-    background = uniform_filter(mag_ndc, size=max(h // 16, 4))
-    residual = mag_ndc - background
-
-    # Keep only the positive residual (where QR bits raised the magnitude)
-    residual = np.clip(residual, 0, None)
-
-    # Normalise to [0,255] and take the upper-right quadrant (positive frequencies)
-    # The symmetric embedding means both quadrants carry the QR and its mirror
-    qr_raw = residual[:cy, cx:]      # top-right quadrant
-    qr_raw = cv2.resize(qr_raw, (w, h), interpolation=cv2.INTER_AREA)
-    qr_vis = cv2.normalize(qr_raw, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
-
-    # Binarise
-    _, qr_bin = cv2.threshold(qr_vis, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    return qr_bin
+    u8 = np.clip(gray, 0, 255).astype(np.uint8)
+    # CLAHE — restores contrast lost to display / exposure variation
+    clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
+    u8 = clahe.apply(u8)
+    # Bilateral denoise — preserves edges better than Gaussian
+    u8 = cv2.bilateralFilter(u8, d=5, sigmaColor=20, sigmaSpace=20)
+    # Unsharp mask — partially reverses camera blur
+    blurred = cv2.GaussianBlur(u8, (0, 0), sigmaX=1.2)
+    u8 = cv2.addWeighted(u8, 1.6, blurred, -0.6, 0)
+    return u8.astype(np.float64)
 
 
 # ── public API ────────────────────────────────────────────────────────────────
 
-def has_watermark(image_path: str) -> bool:
-    """Return True if the image already contains a blind QR watermark."""
-    img = cv2.imread(image_path, cv2.IMREAD_UNCHANGED)
+def has_watermark(image_path: str, camera_mode: bool = False) -> bool:
+    """
+    Return True if the image contains a blind QR watermark.
+
+    camera_mode=True applies extra pre-processing for images captured
+    by a camera or screenshot tool before correlation.
+    """
+    img = cv2.imread(image_path)
     if img is None:
         raise ValueError(f"Cannot read image: {image_path}")
-    return _read_marker(img)
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY).astype(np.float64)
+    if camera_mode:
+        gray = _preprocess_for_detection(gray)
+    ll2, _, _, _ = _dwt2_levels(gray)
+    pn = _pn_sequence(ll2.shape)
+    corr = float(np.dot(ll2.ravel(), pn.ravel())) / ll2.size
+    return corr > DETECT_THRESH
 
 
 def embed(image_path: str, output_path: str, text: str) -> None:
-    """Embed a QR code as a blind watermark and save to output_path."""
+    """
+    Embed a QR code as a blind watermark and save to output_path.
+
+    The QR is embedded in the LL2 (lowest-frequency) DWT subband at
+    QR_ALPHA strength.  A PN detection signature at SIG_ALPHA is added
+    alongside it.  Both survive JPEG compression and camera capture.
+    """
     img = cv2.imread(image_path)
     if img is None:
         raise ValueError(f"Cannot read image: {image_path}")
 
     if has_watermark(image_path):
         raise RuntimeError(
-            "Image already contains a blind watermark. "
-            "Use a different image or extract first."
+            "Image already contains a blind watermark — "
+            "embedding blocked to prevent double-marking."
         )
 
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY).astype(np.float64)
-    h, w = gray.shape
-    qr_arr = _make_qr_array(text, h, w)
+    ll2, subs_l2, subs_l1, ll1_shape = _dwt2_levels(gray)
 
-    gray_wm = _embed_qr_dft(gray, qr_arr)
+    # Build QR and PN at LL2 size
+    qr_arr  = _make_qr_array(text, ll2.shape[0], ll2.shape[1])
+    pn      = _pn_sequence(ll2.shape)
 
-    # Apply DFT watermark change to all colour channels proportionally
+    # Centre QR around 0 so black cells push UP and white cells push DOWN
+    qr_c = qr_arr * 2.0 - 1.0   # maps 0→-1, 1→+1
+
+    ll2_wm = ll2 + QR_ALPHA * qr_c + SIG_ALPHA * pn
+
+    gray_wm = _idwt2_levels(ll2_wm, subs_l2, subs_l1, ll1_shape)
+    gray_wm = np.clip(gray_wm, 0, 255)
+
+    # Apply the luminance delta to all colour channels proportionally
     img_out = img.copy()
-    diff = gray_wm.astype(np.int16) - cv2.cvtColor(img, cv2.COLOR_BGR2GRAY).astype(np.int16)
+    diff = (gray_wm - gray).astype(np.float64)
     for c in range(img.shape[2]):
-        ch = img[:, :, c].astype(np.int16) + diff
+        ch = img[:, :, c].astype(np.float64) + diff
         img_out[:, :, c] = np.clip(ch, 0, 255).astype(np.uint8)
 
-    # Write LSB presence marker
-    img_out = _write_marker(img_out)
     cv2.imwrite(output_path, img_out)
-    print(f"Blind QR watermark embedded successfully -> {output_path}")
+    psnr = 10 * np.log10(255 ** 2 / max(np.mean(diff ** 2), 1e-9))
+    print(f"Watermark embedded → {output_path}  (PSNR {psnr:.1f} dB)")
 
 
-def extract(image_path: str, output_qr_path: str | None = None) -> None:
-    """Extract and display the blind QR watermark from an image."""
+def _extract_qr_arr(gray: np.ndarray,
+                    camera_mode: bool = False) -> np.ndarray | None:
+    """
+    Return the extracted QR pattern as a binary uint8 ndarray, or None if
+    no watermark is detected.  Used internally by extract() and the GUI.
+    """
+    if camera_mode:
+        gray = _preprocess_for_detection(gray)
+
+    ll2, _, _, _ = _dwt2_levels(gray)
+    pn = _pn_sequence(ll2.shape)
+    corr = float(np.dot(ll2.ravel(), pn.ravel())) / ll2.size
+    if corr <= DETECT_THRESH:
+        return None
+
+    # Subtract the PN signature to isolate QR signal + image background
+    ll2_clean = ll2 - SIG_ALPHA * pn
+
+    bg_size  = max(ll2_clean.shape[0] // 6, 8)
+    residual = ll2_clean - uniform_filter(ll2_clean, size=bg_size)
+    residual = np.clip(residual, 0, None)
+
+    qr_vis = cv2.normalize(residual, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+    _, qr_bin = cv2.threshold(qr_vis, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+    # Scale to a scannable size (≥ 300 px on the short side)
+    scale = max(300 // min(qr_bin.shape), 1)
+    return cv2.resize(qr_bin,
+                      (qr_bin.shape[1] * scale, qr_bin.shape[0] * scale),
+                      interpolation=cv2.INTER_NEAREST)
+
+
+def extract(image_path: str,
+            output_qr_path: str | None = None,
+            camera_mode: bool = False) -> None:
+    """
+    Extract the blind QR watermark and optionally save the QR image.
+
+    camera_mode=True pre-processes the image to handle blur / exposure
+    changes from camera capture before extraction.
+    """
     img = cv2.imread(image_path)
     if img is None:
         raise ValueError(f"Cannot read image: {image_path}")
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY).astype(np.float64)
 
-    if not _read_marker(img):
+    qr_big = _extract_qr_arr(gray, camera_mode=camera_mode)
+    if qr_big is None:
         print("No blind watermark detected in this image.")
         return
 
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    qr_bin = _extract_qr_dft(gray)
-
     if output_qr_path:
-        cv2.imwrite(output_qr_path, qr_bin)
-        print(f"Extracted QR pattern saved -> {output_qr_path}")
+        cv2.imwrite(output_qr_path, qr_big)
+        print(f"Extracted QR pattern saved → {output_qr_path}")
     else:
-        print("Watermark detected. Use --output/-o to save the extracted QR image.")
+        print("Watermark detected. Use --output to save the extracted QR image.")
 
-    # Attempt QR decode
+    _try_decode(qr_big)
+
+
+def _try_decode(qr_img: np.ndarray) -> None:
+    """Try pyzbar on both polarities; print decoded content or guidance."""
     try:
         from pyzbar.pyzbar import decode as pyzbar_decode
-        decoded = pyzbar_decode(Image.fromarray(qr_bin))
-        if decoded:
-            for obj in decoded:
-                print(f"QR content: {obj.data.decode('utf-8', errors='replace')}")
-        else:
-            # Try inverting
-            decoded = pyzbar_decode(Image.fromarray(255 - qr_bin))
+        from PIL import Image as _PIL
+        for polarity in (qr_img, 255 - qr_img):
+            decoded = pyzbar_decode(_PIL.fromarray(polarity))
             if decoded:
                 for obj in decoded:
                     print(f"QR content: {obj.data.decode('utf-8', errors='replace')}")
-            else:
-                print("QR pattern extracted but could not be auto-decoded. "
-                      "Save with --output and scan with a QR reader.")
+                return
+        print("QR extracted but auto-decode failed — "
+              "save with --output and scan with a QR reader.")
     except ImportError:
-        print("Tip: install pyzbar for automatic QR decoding: pip install pyzbar")
+        print("Tip: pip install pyzbar  for automatic QR decoding.")
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="Blind QR Watermark Tool (盲水印QR) — invisibly embed or read QR codes in images"
+    ap = argparse.ArgumentParser(
+        description="Blind QR Watermark Tool (盲水印QR) — DWT-based, "
+                    "survives screenshots and camera capture"
     )
-    sub = parser.add_subparsers(dest="command", required=True)
+    ap.add_argument("--camera", action="store_true",
+                    help="Apply camera/screenshot pre-processing before "
+                         "check or extract (CLAHE + denoise + sharpen)")
+    sub = ap.add_subparsers(dest="cmd", required=True)
 
-    emb = sub.add_parser("embed", help="Add a blind QR watermark to an image")
-    emb.add_argument("input", help="Input image path")
-    emb.add_argument("output", help="Output (watermarked) image path")
-    emb.add_argument("--text", "-t", required=True, help="Text or URL to encode as QR")
+    emb = sub.add_parser("embed", help="Add a blind QR watermark")
+    emb.add_argument("input")
+    emb.add_argument("output")
+    emb.add_argument("--text", "-t", required=True,
+                     help="Text or URL to encode as QR")
 
-    chk = sub.add_parser("check", help="Check whether an image already has a blind watermark")
-    chk.add_argument("input", help="Input image path")
+    chk = sub.add_parser("check",
+                         help="Check whether an image already has a watermark")
+    chk.add_argument("input")
 
-    ext = sub.add_parser("extract", help="Extract the blind QR watermark from an image")
-    ext.add_argument("input", help="Input image path")
-    ext.add_argument("--output", "-o", help="Save extracted QR image to this path")
+    ext = sub.add_parser("extract", help="Extract the QR watermark")
+    ext.add_argument("input")
+    ext.add_argument("--output", "-o",
+                     help="Save extracted QR image to this path")
 
-    args = parser.parse_args()
+    args = ap.parse_args()
 
-    if args.command == "embed":
+    if args.cmd == "embed":
         try:
             embed(args.input, args.output, args.text)
         except (RuntimeError, ValueError) as e:
             print(f"Error: {e}", file=sys.stderr)
             sys.exit(1)
 
-    elif args.command == "check":
+    elif args.cmd == "check":
         try:
-            present = has_watermark(args.input)
-            status = "YES" if present else "NO"
-            msg = "already contains" if present else "does not contain"
-            print(f"Watermark present: {status} — this image {msg} a blind QR watermark.")
+            present = has_watermark(args.input, camera_mode=args.camera)
+            label = "YES" if present else "NO"
+            verb  = "contains" if present else "does not contain"
+            print(f"Watermark present: {label} — this image {verb} a blind QR watermark.")
         except ValueError as e:
             print(f"Error: {e}", file=sys.stderr)
             sys.exit(1)
 
-    elif args.command == "extract":
+    elif args.cmd == "extract":
         try:
-            extract(args.input, args.output)
+            extract(args.input, args.output, camera_mode=args.camera)
         except ValueError as e:
             print(f"Error: {e}", file=sys.stderr)
             sys.exit(1)
